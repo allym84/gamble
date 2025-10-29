@@ -1,5 +1,5 @@
 # run_model.py
-# Smart Elo + Poisson with odds + value picks
+# Smart Elo + Poisson with odds + value picks + RECENT FORM TRACKING
 # Clean ASCII-only output for email & Telegram
 
 import os
@@ -50,10 +50,16 @@ HOME_ELO_BONUS = 60
 ELO_FORM_BOOST = 12        # 12*(wins-losses)
 ELO_GD_FACTOR  = 10.0      # 10*(GF - GA)
 
+# NEW: Recent form parameters
+RECENT_FORM_GAMES = 6      # Last 6 games for form
+FORM_POINTS_WEIGHT = 5     # Weight for form points in Elo
+FORM_GD_WEIGHT = 8         # Weight for form goal difference in Elo
+
 def elo_weight(played_total: int) -> float:
-    if played_total <= 5:  return 0.75
+    # REVERSED: Early season trust stats more, late season trust Elo/form more
+    if played_total <= 5:  return 0.35
     if played_total <= 15: return 0.55
-    return 0.35
+    return 0.75  # Trust Elo more as season progresses
 
 # Odds / value settings
 BOOKMAKER_ID = 8           # Bet365
@@ -129,6 +135,47 @@ def fetch_fixtures_for_today():
                 continue
     return pd.DataFrame(all_rows)
 
+def fetch_recent_form(team_id: int, league_id: int, last_n: int = RECENT_FORM_GAMES):
+    """Fetch last N fixtures for recent form calculation"""
+    params = {
+        "team": team_id,
+        "league": league_id, 
+        "season": SEASON,
+        "last": last_n
+    }
+    try:
+        r = requests.get(f"{BASE_URL}/fixtures", params=params, headers=HEADERS, timeout=12)
+        fixtures = r.json().get("response", [])
+        
+        form_points = 0
+        form_gd = 0
+        games_counted = 0
+        
+        for f in fixtures:
+            # Only count finished games
+            if f["fixture"]["status"]["short"] not in ["FT", "AET", "PEN"]:
+                continue
+                
+            is_home = f["teams"]["home"]["id"] == team_id
+            goals_for = f["goals"]["home"] if is_home else f["goals"]["away"]
+            goals_against = f["goals"]["away"] if is_home else f["goals"]["home"]
+            
+            if goals_for is None or goals_against is None:
+                continue
+            
+            form_gd += (goals_for - goals_against)
+            
+            if goals_for > goals_against:
+                form_points += 3
+            elif goals_for == goals_against:
+                form_points += 1
+            
+            games_counted += 1
+                
+        return form_points, form_gd, games_counted
+    except Exception:
+        return 0, 0, 0
+
 def fetch_team_stats(team_id: int, league_id: int):
     try:
         params = {"team": team_id, "league": league_id, "season": SEASON}
@@ -150,8 +197,14 @@ def fetch_team_stats(team_id: int, league_id: int):
         gf_away = float(goals.get("for", {}).get("average", {}).get("away", 0) or 0)
         ga_away = float(goals.get("against", {}).get("average", {}).get("away", 0) or 0)
 
-        # simple form-elo proxy
-        elo = ELO_START + ELO_FORM_BOOST * (wins - losses) + ELO_GD_FACTOR * ((gf_home + gf_away) - (ga_home + ga_away))
+        # Base Elo on season performance
+        base_elo = ELO_START + ELO_FORM_BOOST * (wins - losses) + ELO_GD_FACTOR * ((gf_home + gf_away) - (ga_home + ga_away))
+
+        # Add recent form boost (more weight to recent games)
+        form_pts, form_gd, form_games = fetch_recent_form(team_id, league_id)
+        form_boost = form_pts * FORM_POINTS_WEIGHT + form_gd * FORM_GD_WEIGHT
+
+        elo = float(base_elo + form_boost)
 
         return {
             "team_id": team_id,
@@ -163,7 +216,10 @@ def fetch_team_stats(team_id: int, league_id: int):
             "ga_home": ga_home,
             "gf_away": gf_away,
             "ga_away": ga_away,
-            "elo": float(elo),
+            "elo": elo,
+            "form_points": form_pts,
+            "form_gd": form_gd,
+            "form_games": form_games,
         }
     except Exception:
         return None
@@ -250,7 +306,7 @@ def main():
         hs, as_ = stats_by_team[hid], stats_by_team[aid]
         lid = int(fx["league_id"])
 
-        # Dynamic Elo weight by played volume
+        # Dynamic Elo weight by played volume (REVERSED - trust Elo more late season)
         wE = elo_weight(int(hs["played"] + as_["played"]) // 2)
 
         # Elo expectations
@@ -262,6 +318,14 @@ def main():
         # Baseline lambdas
         lh_base = max(0.05, lg_home_avg.get(lid, 1.25)) * hs["att_h"] * as_["def_a"] * HFA
         la_base = max(0.05, lg_away_avg.get(lid, 1.10)) * as_["att_a"] * hs["def_h"]
+
+        # Adjust for recent form momentum
+        max_form_points = RECENT_FORM_GAMES * 3  # Max possible points
+        form_multiplier_home = 0.90 + (hs["form_points"] / max_form_points) * 0.20
+        form_multiplier_away = 0.90 + (as_["form_points"] / max_form_points) * 0.20
+
+        lh_base *= form_multiplier_home
+        la_base *= form_multiplier_away
 
         # Blend Elo into lambdas
         lh = float(np.clip(lh_base * ((1 - wE) + wE * exp_h), 0.05, 4.5))
@@ -293,6 +357,10 @@ def main():
             "confidence": confidence_label(max(p_h, p_a) * 100),
             "odds_win_home": odds.get("win_home"),
             "odds_win_away": odds.get("win_away"),
+            "home_elo": round(elo_h, 0),
+            "away_elo": round(elo_a, 0),
+            "home_form": f"{hs['form_points']}pts/{hs['form_games']}g",
+            "away_form": f"{as_['form_points']}pts/{as_['form_games']}g",
         })
 
         btts_rows.append({
