@@ -1,3 +1,4 @@
+# Enable schedule trigger
 name: Daily Auto Model
 
 on:
