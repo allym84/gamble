@@ -1,4 +1,5 @@
 # Enable schedule trigger
+# adding this so I can push changes and test the workflow manually 
 name: Daily Auto Model
 
 on:
