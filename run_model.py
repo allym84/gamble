@@ -1,15 +1,17 @@
-# run_model.py
-# Smart Elo + Poisson with odds + value picks + RECENT FORM TRACKING
+# simple_model.py
+# Historical-based betting model using last 10 games + head-to-head data
 # Clean ASCII-only output for email & Telegram
 
 import os
-import math
+import sys
 import requests
 import pandas as pd
-import numpy as np
-from datetime import datetime as dt, timedelta, UTC
+from datetime import datetime as dt, UTC
 from unidecode import unidecode
 from dotenv import load_dotenv
+
+# Force unbuffered UTF-8 output
+sys.stdout.reconfigure(encoding="utf-8", line_buffering=True)
 
 load_dotenv()
 
@@ -27,7 +29,7 @@ HEADERS = {"x-apisports-key": API_KEY}
 TODAY = dt.now(UTC).date()
 SEASON = TODAY.year if TODAY.month >= 7 else TODAY.year - 1
 
-# Included competitions (FULL NAMES kept from API; we exclude EFL Trophy and U21 fixtures)
+# Included competitions
 LEAGUE_GROUPS = {
     "England": [
         39,  # Premier League
@@ -42,71 +44,41 @@ LEAGUE_GROUPS = {
     "Europe": [2, 3, 848],   # UCL, UEL, UECL
 }
 
-# Model knobs
-HFA = 1.10                 # home-field advantage multiplier
-MAX_GOALS = 8              # Poisson grid size
-ELO_START = 1500
-HOME_ELO_BONUS = 60
-ELO_FORM_BOOST = 12        # 12*(wins-losses)
-ELO_GD_FACTOR  = 10.0      # 10*(GF - GA)
+# Model settings
+LAST_N_GAMES = 10          # Look at last 10 games for each team
+H2H_LAST_N = 5             # Look at last 5 head-to-head meetings
+MIN_BTTS_PROB = 45.0       # Show BTTS picks above 45%
+MIN_OVER_PROB = 50.0       # Show Over 2.5 picks above 50%
+MIN_WIN_PROB = 55.0        # Show Win picks above 55%
 
-# NEW: Recent form parameters
-RECENT_FORM_GAMES = 6      # Last 6 games for form
-FORM_POINTS_WEIGHT = 5     # Weight for form points in Elo
-FORM_GD_WEIGHT = 8         # Weight for form goal difference in Elo
-
-def elo_weight(played_total: int) -> float:
-    # REVERSED: Early season trust stats more, late season trust Elo/form more
-    if played_total <= 5:  return 0.35
-    if played_total <= 15: return 0.55
-    return 0.75  # Trust Elo more as season progresses
-
-# Odds / value settings
-BOOKMAKER_ID = 8           # Bet365
-VALUE_THRESHOLD = 10.0     # show edges >= 10%
+# NEW: Accuracy improvements
+HOME_ADVANTAGE_BOOST = 8.0  # Add 8% to home win probability
+H2H_WEIGHT = 0.25           # Reduced from 0.40 to 0.25 (25% h2h, 75% recent)
+RECENCY_DECAY = 0.9         # Exponential decay for older games
 
 # =========================
 # HELPERS
 # =========================
-def confidence_label(pct: float) -> str:
-    if pct >= 80: return "High"
-    if pct >= 60: return "Medium"
-    return "Low"
-
 def fmt_time_eu(iso_str: str) -> str:
-    # "Wed 19:45" Europe/London
     try:
         ts = pd.to_datetime(iso_str, utc=True).tz_convert("Europe/London")
         return ts.strftime("%a %H:%M")
     except Exception:
         return iso_str
 
-def poisson_pmf(lam, k):
-    return (lam ** k) * math.exp(-lam) / math.factorial(k)
+def confidence_label(pct: float) -> str:
+    if pct >= 70: return "High"
+    if pct >= 55: return "Medium"
+    return "Low"
 
-def poisson_match_probs(lh, la):
-    p_home = p_draw = p_away = p_btts = p_over25 = 0.0
-    for i in range(MAX_GOALS + 1):
-        pi = poisson_pmf(lh, i)
-        for j in range(MAX_GOALS + 1):
-            pj = poisson_pmf(la, j)
-            p = pi * pj
-            if i > j: p_home += p
-            elif i == j: p_draw += p
-            else: p_away += p
-            if i > 0 and j > 0: p_btts += p
-            if i + j >= 3: p_over25 += p
-    total = p_home + p_draw + p_away
-    if total > 0:
-        p_home /= total; p_draw /= total; p_away /= total
-    return p_home, p_draw, p_away, p_btts, p_over25
-
-def implied_prob_from_odds(od):
-    try:
-        od = float(od)
-        return 100.0 / od if od > 0 else None
-    except (TypeError, ValueError):
-        return None
+def weighted_average(values, weights):
+    """Calculate weighted average with recency decay"""
+    if not values or not weights:
+        return 0.0
+    total_weight = sum(weights)
+    if total_weight == 0:
+        return 0.0
+    return sum(v * w for v, w in zip(values, weights)) / total_weight
 
 # =========================
 # API FETCHERS
@@ -127,7 +99,7 @@ def fetch_fixtures_for_today():
                         "home_team": f["teams"]["home"]["name"],
                         "away_team": f["teams"]["away"]["name"],
                         "league_id": lid,
-                        "league": f["league"]["name"],  # full name from API
+                        "league": f["league"]["name"],
                         "region": region,
                         "kickoff": f["fixture"]["date"],
                     })
@@ -135,125 +107,179 @@ def fetch_fixtures_for_today():
                 continue
     return pd.DataFrame(all_rows)
 
-def fetch_recent_form(team_id: int, league_id: int, last_n: int = RECENT_FORM_GAMES):
-    """Fetch last N fixtures for recent form calculation"""
+def fetch_last_n_games(team_id: int, league_id: int, last_n: int = LAST_N_GAMES, venue: str = None):
+    """
+    Fetch last N finished games for a team
+    venue: 'home', 'away', or None for all games
+    """
     params = {
         "team": team_id,
-        "league": league_id, 
+        "league": league_id,
         "season": SEASON,
-        "last": last_n
+        "last": last_n * 3,  # Get more to ensure we have N finished games
     }
+    if venue:
+        params["venue"] = venue
+    
     try:
         r = requests.get(f"{BASE_URL}/fixtures", params=params, headers=HEADERS, timeout=12)
         fixtures = r.json().get("response", [])
         
-        form_points = 0
-        form_gd = 0
-        games_counted = 0
-        
+        results = []
         for f in fixtures:
-            # Only count finished games
             if f["fixture"]["status"]["short"] not in ["FT", "AET", "PEN"]:
                 continue
-                
-            is_home = f["teams"]["home"]["id"] == team_id
-            goals_for = f["goals"]["home"] if is_home else f["goals"]["away"]
-            goals_against = f["goals"]["away"] if is_home else f["goals"]["home"]
             
-            if goals_for is None or goals_against is None:
+            is_home = f["teams"]["home"]["id"] == team_id
+            gf = f["goals"]["home"] if is_home else f["goals"]["away"]
+            ga = f["goals"]["away"] if is_home else f["goals"]["home"]
+            
+            if gf is None or ga is None:
                 continue
             
-            form_gd += (goals_for - goals_against)
+            results.append({
+                "won": gf > ga,
+                "btts": gf > 0 and ga > 0,
+                "over25": (gf + ga) >= 3,
+                "gf": gf,
+                "ga": ga,
+                "is_home": is_home,
+            })
             
-            if goals_for > goals_against:
-                form_points += 3
-            elif goals_for == goals_against:
-                form_points += 1
+            if len(results) >= last_n:
+                break
+        
+        return results
+    except Exception:
+        return []
+
+def fetch_head_to_head(home_id: int, away_id: int, last_n: int = H2H_LAST_N):
+    """Fetch last N head-to-head meetings between two teams"""
+    params = {
+        "h2h": f"{home_id}-{away_id}",
+        "last": last_n * 2,
+    }
+    try:
+        r = requests.get(f"{BASE_URL}/fixtures/headtohead", params=params, headers=HEADERS, timeout=12)
+        fixtures = r.json().get("response", [])
+        
+        results = []
+        for f in fixtures:
+            if f["fixture"]["status"]["short"] not in ["FT", "AET", "PEN"]:
+                continue
             
-            games_counted += 1
-                
-        return form_points, form_gd, games_counted
+            home_goals = f["goals"]["home"]
+            away_goals = f["goals"]["away"]
+            
+            if home_goals is None or away_goals is None:
+                continue
+            
+            was_home_id = f["teams"]["home"]["id"]
+            
+            results.append({
+                "home_won": (home_goals > away_goals and was_home_id == home_id) or 
+                           (away_goals > home_goals and was_home_id == away_id),
+                "away_won": (away_goals > home_goals and was_home_id == home_id) or 
+                           (home_goals > away_goals and was_home_id == away_id),
+                "btts": home_goals > 0 and away_goals > 0,
+                "over25": (home_goals + away_goals) >= 3,
+            })
+            
+            if len(results) >= last_n:
+                break
+        
+        return results
     except Exception:
-        return 0, 0, 0
+        return []
 
-def fetch_team_stats(team_id: int, league_id: int):
-    try:
-        params = {"team": team_id, "league": league_id, "season": SEASON}
-        r = requests.get(f"{BASE_URL}/teams/statistics", params=params, headers=HEADERS, timeout=12)
-        js = r.json().get("response", {})
-        if not js:
-            return None
-
-        team_name  = unidecode(js["team"]["name"])
-        league_name = unidecode(js["league"]["name"])
-        fixtures   = js.get("fixtures", {})
-        played     = fixtures.get("played", {}).get("total", 0) or 0
-        wins       = fixtures.get("wins", {}).get("total", 0) or 0
-        losses     = fixtures.get("loses", {}).get("total", 0) or 0
-
-        goals   = js.get("goals", {})
-        gf_home = float(goals.get("for", {}).get("average", {}).get("home", 0) or 0)
-        ga_home = float(goals.get("against", {}).get("average", {}).get("home", 0) or 0)
-        gf_away = float(goals.get("for", {}).get("average", {}).get("away", 0) or 0)
-        ga_away = float(goals.get("against", {}).get("average", {}).get("away", 0) or 0)
-
-        # Base Elo on season performance
-        base_elo = ELO_START + ELO_FORM_BOOST * (wins - losses) + ELO_GD_FACTOR * ((gf_home + gf_away) - (ga_home + ga_away))
-
-        # Add recent form boost (more weight to recent games)
-        form_pts, form_gd, form_games = fetch_recent_form(team_id, league_id)
-        form_boost = form_pts * FORM_POINTS_WEIGHT + form_gd * FORM_GD_WEIGHT
-
-        elo = float(base_elo + form_boost)
-
-        return {
-            "team_id": team_id,
-            "team": team_name,
-            "league_id": league_id,
-            "league": league_name,
-            "played": int(played),
-            "gf_home": gf_home,
-            "ga_home": ga_home,
-            "gf_away": gf_away,
-            "ga_away": ga_away,
-            "elo": elo,
-            "form_points": form_pts,
-            "form_gd": form_gd,
-            "form_games": form_games,
-        }
-    except Exception:
-        return None
-
-def fetch_odds(fixture_id: int):
-    """Bet365 odds for Win, BTTS Yes, Over 2.5."""
-    params = {"fixture": fixture_id, "bookmaker": BOOKMAKER_ID}
-    try:
-        r = requests.get(f"{BASE_URL}/odds", params=params, headers=HEADERS, timeout=12)
-        resp = r.json().get("response", [])
-        if not resp:
-            return {}
-        bets = resp[0].get("bookmakers", [])[0].get("bets", [])
-        out = {}
-        for b in bets:
-            name = b.get("name", "")
-            for v in b.get("values", []):
-                if "Winner" in name:
-                    if v["value"] == "Home": out["win_home"] = float(v["odd"])
-                    if v["value"] == "Away": out["win_away"] = float(v["odd"])
-                if "Both Teams Score" in name and v["value"] == "Yes":
-                    out["btts"] = float(v["odd"])
-                if "Over/Under" in name and v["value"] == "Over 2.5":
-                    out["over25"] = float(v["odd"])
-        return out
-    except Exception:
-        return {}
+def calculate_probabilities(home_id: int, away_id: int, league_id: int):
+    """Calculate BTTS, Over 2.5, and Win probabilities from historical data"""
+    
+    # Get last N games - SPLIT BY VENUE for better accuracy
+    home_home_games = fetch_last_n_games(home_id, league_id, venue="home")
+    away_away_games = fetch_last_n_games(away_id, league_id, venue="away")
+    
+    # Also get overall recent form (all venues)
+    home_all_games = fetch_last_n_games(home_id, league_id)
+    away_all_games = fetch_last_n_games(away_id, league_id)
+    
+    # Get head-to-head history
+    h2h_games = fetch_head_to_head(home_id, away_id)
+    
+    # === BTTS Calculation (with recency weighting) ===
+    def calc_weighted_btts(games):
+        if not games:
+            return 0.0
+        weights = [RECENCY_DECAY ** i for i in range(len(games))]
+        values = [1.0 if g["btts"] else 0.0 for g in games]
+        return weighted_average(values, weights) * 100
+    
+    # Home team BTTS at home, Away team BTTS away
+    home_btts_pct = calc_weighted_btts(home_home_games) if home_home_games else calc_weighted_btts(home_all_games)
+    away_btts_pct = calc_weighted_btts(away_away_games) if away_away_games else calc_weighted_btts(away_all_games)
+    
+    # === Over 2.5 Calculation ===
+    def calc_weighted_over(games):
+        if not games:
+            return 0.0
+        weights = [RECENCY_DECAY ** i for i in range(len(games))]
+        values = [1.0 if g["over25"] else 0.0 for g in games]
+        return weighted_average(values, weights) * 100
+    
+    home_over_pct = calc_weighted_over(home_home_games) if home_home_games else calc_weighted_over(home_all_games)
+    away_over_pct = calc_weighted_over(away_away_games) if away_away_games else calc_weighted_over(away_all_games)
+    
+    # === Win Calculation (venue-specific) ===
+    def calc_weighted_wins(games):
+        if not games:
+            return 0.0
+        weights = [RECENCY_DECAY ** i for i in range(len(games))]
+        values = [1.0 if g["won"] else 0.0 for g in games]
+        return weighted_average(values, weights) * 100
+    
+    home_win_pct = calc_weighted_wins(home_home_games) if home_home_games else calc_weighted_wins(home_all_games)
+    away_win_pct = calc_weighted_wins(away_away_games) if away_away_games else calc_weighted_wins(away_all_games)
+    
+    # === H2H Percentages ===
+    h2h_btts_pct = (sum(g["btts"] for g in h2h_games) / len(h2h_games) * 100) if h2h_games else None
+    h2h_over_pct = (sum(g["over25"] for g in h2h_games) / len(h2h_games) * 100) if h2h_games else None
+    h2h_home_win_pct = (sum(g["home_won"] for g in h2h_games) / len(h2h_games) * 100) if h2h_games else None
+    h2h_away_win_pct = (sum(g["away_won"] for g in h2h_games) / len(h2h_games) * 100) if h2h_games else None
+    
+    # === Weighted Blend: 75% recent form, 25% H2H ===
+    if h2h_btts_pct is not None and len(h2h_games) >= 3:
+        btts_prob = ((home_btts_pct + away_btts_pct) / 2) * (1 - H2H_WEIGHT) + h2h_btts_pct * H2H_WEIGHT
+        over_prob = ((home_over_pct + away_over_pct) / 2) * (1 - H2H_WEIGHT) + h2h_over_pct * H2H_WEIGHT
+        home_win_prob = home_win_pct * (1 - H2H_WEIGHT) + h2h_home_win_pct * H2H_WEIGHT
+        away_win_prob = away_win_pct * (1 - H2H_WEIGHT) + h2h_away_win_pct * H2H_WEIGHT
+    else:
+        # No/insufficient H2H data, use only recent form
+        btts_prob = (home_btts_pct + away_btts_pct) / 2
+        over_prob = (home_over_pct + away_over_pct) / 2
+        home_win_prob = home_win_pct
+        away_win_prob = away_win_pct
+    
+    # === Apply Home Advantage to Win Probabilities ===
+    home_win_prob = min(95.0, home_win_prob + HOME_ADVANTAGE_BOOST)
+    away_win_prob = max(5.0, away_win_prob - (HOME_ADVANTAGE_BOOST * 0.3))  # Slight penalty for away
+    
+    return {
+        "btts_prob": round(btts_prob, 2),
+        "over_prob": round(over_prob, 2),
+        "home_win_prob": round(home_win_prob, 2),
+        "away_win_prob": round(away_win_prob, 2),
+        "home_games_count": len(home_home_games) if home_home_games else len(home_all_games),
+        "away_games_count": len(away_away_games) if away_away_games else len(away_all_games),
+        "h2h_count": len(h2h_games),
+    }
 
 # =========================
 # MAIN
 # =========================
 def main():
     lines = []
-    lines.append(f"Running model for fixtures on {TODAY}")
+    lines.append(f"Running historical model for fixtures on {TODAY}")
+    lines.append(f"(Based on last {LAST_N_GAMES} games + last {H2H_LAST_N} head-to-head)")
     lines.append("")
     lines.append(f"Fetching fixtures on {TODAY}...")
 
@@ -263,204 +289,117 @@ def main():
 
     if df_fx.empty:
         print("\n".join(lines))
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
-    # Build team stats
-    team_ids = sorted(list(set(df_fx["home_id"]).union(set(df_fx["away_id"]))))
+    # Process each fixture
+    btts_rows, over_rows, win_rows = [], [], []
 
-    stat_rows = []
-    for tid in team_ids:
-        lid = df_fx.loc[(df_fx["home_id"] == tid) | (df_fx["away_id"] == tid), "league_id"].iloc[0]
-        s = fetch_team_stats(int(tid), int(lid))
-        if s:
-            stat_rows.append(s)
-    df_stats = pd.DataFrame(stat_rows)
-    if df_stats.empty:
-        print("\n".join(lines + ["No team statistics returned from API"]))
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
-
-    # League base means (home/away goals)
-    lg_home_avg = df_stats.groupby("league_id")["gf_home"].mean().to_dict()
-    lg_away_avg = df_stats.groupby("league_id")["gf_away"].mean().to_dict()
-
-    # Strengths
-    def strengths(row):
-        lid = int(row["league_id"])
-        row["att_h"] = row["gf_home"] / max(lg_home_avg.get(lid, 1e-6), 1e-6)
-        row["def_h"] = row["ga_home"] / max(lg_home_avg.get(lid, 1e-6), 1e-6)
-        row["att_a"] = row["gf_away"] / max(lg_away_avg.get(lid, 1e-6), 1e-6)
-        row["def_a"] = row["ga_away"] / max(lg_away_avg.get(lid, 1e-6), 1e-6)
-        return row
-
-    df_stats = df_stats.apply(strengths, axis=1)
-    stats_by_team = {int(r["team_id"]): r for _, r in df_stats.iterrows()}
-
-    # Per-fixture model
-    match_rows, btts_rows, over_rows = [], [], []
-
-    for _, fx in df_fx.iterrows():
+    for idx, fx in df_fx.iterrows():
         hid, aid = int(fx["home_id"]), int(fx["away_id"])
-        if hid not in stats_by_team or aid not in stats_by_team:
-            continue
-
-        hs, as_ = stats_by_team[hid], stats_by_team[aid]
         lid = int(fx["league_id"])
-
-        # Dynamic Elo weight by played volume (REVERSED - trust Elo more late season)
-        wE = elo_weight(int(hs["played"] + as_["played"]) // 2)
-
-        # Elo expectations
-        elo_h = float(hs["elo"]) + HOME_ELO_BONUS
-        elo_a = float(as_["elo"])
-        exp_h = 1.0 / (1.0 + 10 ** ((elo_a - elo_h) / 400.0))
-        exp_a = 1.0 - exp_h
-
-        # Baseline lambdas
-        lh_base = max(0.05, lg_home_avg.get(lid, 1.25)) * hs["att_h"] * as_["def_a"] * HFA
-        la_base = max(0.05, lg_away_avg.get(lid, 1.10)) * as_["att_a"] * hs["def_h"]
-
-        # Adjust for recent form momentum
-        max_form_points = RECENT_FORM_GAMES * 3  # Max possible points
-        form_multiplier_home = 0.90 + (hs["form_points"] / max_form_points) * 0.20
-        form_multiplier_away = 0.90 + (as_["form_points"] / max_form_points) * 0.20
-
-        lh_base *= form_multiplier_home
-        la_base *= form_multiplier_away
-
-        # Blend Elo into lambdas
-        lh = float(np.clip(lh_base * ((1 - wE) + wE * exp_h), 0.05, 4.5))
-        la = float(np.clip(la_base * ((1 - wE) + wE * exp_a), 0.05, 4.5))
-
-        # Poisson matrix
-        p_h, p_d, p_a, p_b, p_o = poisson_match_probs(lh, la)
-
-        # Odds (Bet365)
-        odds = fetch_odds(int(fx["fixture_id"]))
-
-        # Strings
+        
+        # Calculate probabilities
+        probs = calculate_probabilities(hid, aid, lid)
+        
         fixture_str = unidecode(f"{fx['home_team']} vs {fx['away_team']}")
-        league_str  = unidecode(str(fx["league"]))
+        league_str = unidecode(str(fx["league"]))
         ko_str = fmt_time_eu(fx["kickoff"])
+        
+        # BTTS picks
+        if probs["btts_prob"] >= MIN_BTTS_PROB:
+            btts_rows.append({
+                "kickoff": ko_str,
+                "fixture": fixture_str,
+                "league": league_str,
+                "region": fx["region"],
+                "prob": probs["btts_prob"],
+                "confidence": confidence_label(probs["btts_prob"]),
+                "data_quality": f"({probs['home_games_count']}+{probs['away_games_count']}+{probs['h2h_count']}H2H)"
+            })
+        
+        # Over 2.5 picks
+        if probs["over_prob"] >= MIN_OVER_PROB:
+            over_rows.append({
+                "kickoff": ko_str,
+                "fixture": fixture_str,
+                "league": league_str,
+                "region": fx["region"],
+                "prob": probs["over_prob"],
+                "confidence": confidence_label(probs["over_prob"]),
+                "data_quality": f"({probs['home_games_count']}+{probs['away_games_count']}+{probs['h2h_count']}H2H)"
+            })
+        
+        # Win picks
+        if probs["home_win_prob"] >= MIN_WIN_PROB or probs["away_win_prob"] >= MIN_WIN_PROB:
+            if probs["home_win_prob"] > probs["away_win_prob"]:
+                pick_team = unidecode(str(fx["home_team"]))
+                win_prob = probs["home_win_prob"]
+            else:
+                pick_team = unidecode(str(fx["away_team"]))
+                win_prob = probs["away_win_prob"]
+            
+            win_rows.append({
+                "kickoff": ko_str,
+                "fixture": fixture_str,
+                "league": league_str,
+                "region": fx["region"],
+                "pick_team": pick_team,
+                "prob": win_prob,
+                "confidence": confidence_label(win_prob),
+                "data_quality": f"({probs['home_games_count']}+{probs['away_games_count']}+{probs['h2h_count']}H2H)"
+            })
+        
+        # Progress indicator
+        if (idx + 1) % 10 == 0:
+            print(f"Processed {idx + 1}/{len(df_fx)} fixtures...")
 
-        match_rows.append({
-            "fixture_id": int(fx["fixture_id"]),
-            "fixture": fixture_str,
-            "home_team": unidecode(str(fx["home_team"])),
-            "away_team": unidecode(str(fx["away_team"])),
-            "league": league_str,
-            "region": fx["region"],
-            "kickoff": ko_str,
-            "home_win_prob": round(p_h * 100, 2),
-            "away_win_prob": round(p_a * 100, 2),
-            "win_prob": round(max(p_h, p_a) * 100, 2),
-            "pick_team": unidecode(str(fx["home_team"] if p_h > p_a else fx["away_team"])),
-            "confidence": confidence_label(max(p_h, p_a) * 100),
-            "odds_win_home": odds.get("win_home"),
-            "odds_win_away": odds.get("win_away"),
-            "home_elo": round(elo_h, 0),
-            "away_elo": round(elo_a, 0),
-            "home_form": f"{hs['form_points']}pts/{hs['form_games']}g",
-            "away_form": f"{as_['form_points']}pts/{as_['form_games']}g",
-        })
-
-        btts_rows.append({
-            "fixture_id": int(fx["fixture_id"]),
-            "fixture": fixture_str,
-            "league": league_str,
-            "region": fx["region"],
-            "kickoff": ko_str,
-            "btts_prob": round(p_b * 100, 2),
-            "confidence": confidence_label(p_b * 100),
-            "odds_btts": odds.get("btts"),
-        })
-
-        over_rows.append({
-            "fixture_id": int(fx["fixture_id"]),
-            "fixture": fixture_str,
-            "league": league_str,
-            "region": fx["region"],
-            "kickoff": ko_str,
-            "over25_prob": round(p_o * 100, 2),
-            "confidence": confidence_label(p_o * 100),
-            "odds_over25": odds.get("over25"),
-        })
-
-    df_match = pd.DataFrame(match_rows)
-    df_btts  = pd.DataFrame(btts_rows)
-    df_over  = pd.DataFrame(over_rows)
-
-    # Remove U21 & EFL Trophy for quality
-    for df in (df_match, df_btts, df_over):
+    df_btts = pd.DataFrame(btts_rows)
+    df_over = pd.DataFrame(over_rows)
+    df_win = pd.DataFrame(win_rows)
+    
+    # Remove U21 & EFL Trophy
+    for df in (df_btts, df_over, df_win):
         if not df.empty:
             df.drop(df[df["fixture"].str.contains("U21", case=False, na=False)].index, inplace=True)
             df.drop(df[df["league"].str.contains("EFL Trophy", case=False, na=False)].index, inplace=True)
 
-    # ===== VALUE PICKS =====
-    value_rows = []
+    # ===== OUTPUT SECTIONS =====
+    total_fixtures = len(df_fx)
+    total_btts = len(df_btts)
+    total_win = len(df_win)
+    total_over = len(df_over)
 
-    # Win market (home/away)
-    for _, r in df_match.iterrows():
-        ih = implied_prob_from_odds(r.get("odds_win_home"))
-        ia = implied_prob_from_odds(r.get("odds_win_away"))
+    lines.append("=======================================")
+    lines.append(f"⚽ Historical Model - {TODAY}")
+    lines.append(f"Fixtures: {total_fixtures} | BTTS: {total_btts} | Win: {total_win} | Over 2.5: {total_over}")
+    lines.append("=======================================")
+    lines.append("")
 
-        if ih is not None:
-            edge = r["home_win_prob"] - ih
-            if edge >= VALUE_THRESHOLD:
-                value_rows.append({
-                    "kickoff": r["kickoff"],
-                    "fixture": r["fixture"],
-                    "market": "Win (Home)",
-                    "prob": r["home_win_prob"],
-                    "value_edge": round(edge, 2),
-                    "league": r["league"],
-                })
-        if ia is not None:
-            edge = r["away_win_prob"] - ia
-            if edge >= VALUE_THRESHOLD:
-                value_rows.append({
-                    "kickoff": r["kickoff"],
-                    "fixture": r["fixture"],
-                    "market": "Win (Away)",
-                    "prob": r["away_win_prob"],
-                    "value_edge": round(edge, 2),
-                    "league": r["league"],
-                })
+    # Emoji-based confidence indicators
+    def conf_emoji(pct):
+        if pct >= 80:
+            return "🔥🔥"
+        elif pct >= 70:
+            return "🔥"
+        elif pct >= 55:
+            return "⚖️"
+        else:
+            return "❄️"
 
-    # BTTS
-    for _, r in df_btts.iterrows():
-        ib = implied_prob_from_odds(r.get("odds_btts"))
-        if ib is None: continue
-        edge = r["btts_prob"] - ib
-        if edge >= VALUE_THRESHOLD:
-            value_rows.append({
-                "kickoff": r["kickoff"],
-                "fixture": r["fixture"],
-                "market": "BTTS",
-                "prob": r["btts_prob"],
-                "value_edge": round(edge, 2),
-                "league": r["league"],
-            })
+    # Formatters
+    def fmt_btts_line(r):
+        return f"• {r['kickoff']:<8} | {r['fixture']:<28} | {r['prob']:>5.1f}% {conf_emoji(r['prob'])} | {r['league']}"
 
-    # Over 2.5
-    for _, r in df_over.iterrows():
-        io = implied_prob_from_odds(r.get("odds_over25"))
-        if io is None: continue
-        edge = r["over25_prob"] - io
-        if edge >= VALUE_THRESHOLD:
-            value_rows.append({
-                "kickoff": r["kickoff"],
-                "fixture": r["fixture"],
-                "market": "Over 2.5",
-                "prob": r["over25_prob"],
-                "value_edge": round(edge, 2),
-                "league": r["league"],
-            })
+    def fmt_over_line(r):
+        return f"• {r['kickoff']:<8} | {r['fixture']:<28} | {r['prob']:>5.1f}% {conf_emoji(r['prob'])} | {r['league']}"
 
-    df_value = pd.DataFrame(value_rows)
+    def fmt_win_line(r):
+        return f"• {r['kickoff']:<8} | {r['fixture']:<28} | {r['pick_team']:<16} | {r['prob']:>5.1f}% {conf_emoji(r['prob'])} | {r['league']}"
 
-    # ===== SECTION BUILDERS (ASCII only, consistent) =====
     def print_section_header(title):
+        lines.append("=======================================")
         lines.append(title)
+        lines.append("=======================================")
 
     def add_list_or_none(df, formatter, limit, none_msg="No qualifying picks"):
         if df is None or df.empty:
@@ -471,74 +410,48 @@ def main():
             lines.append(formatter(r))
         lines.append("")
 
-    def fmt_pct(x):
-        try:
-            return f"{float(x):.2f}%"
-        except Exception:
-            return f"{x}%"
+    # --- BTTS ---
+    print_section_header(f"BTTS - England (≥{MIN_BTTS_PROB}%)")
+    eng_btts = df_btts[df_btts["region"] == "England"].sort_values(["prob"], ascending=False)
+    add_list_or_none(eng_btts, fmt_btts_line, 15)
 
-    def fmt_btts_line(r):
-        return f"{r['kickoff']} {r['fixture']} - {fmt_pct(r['btts_prob'])} - {r['league']}"
+    print_section_header(f"BTTS - Scotland (≥{MIN_BTTS_PROB}%)")
+    sco_btts = df_btts[df_btts["region"] == "Scotland"].sort_values(["prob"], ascending=False)
+    add_list_or_none(sco_btts, fmt_btts_line, 10)
 
-    def fmt_win_line(r):
-        return f"{r['kickoff']} {r['fixture']} - {r['pick_team']} - {fmt_pct(r['win_prob'])} - {r['league']}"
+    print_section_header(f"BTTS - Germany (≥{MIN_BTTS_PROB}%)")
+    ger_btts = df_btts[df_btts["region"] == "Germany"].sort_values(["prob"], ascending=False)
+    add_list_or_none(ger_btts, fmt_btts_line, 10)
 
-    def fmt_over_line(r):
-        return f"{r['kickoff']} {r['fixture']} - {fmt_pct(r['over25_prob'])} - {r['league']}"
+    print_section_header(f"BTTS - Europe (≥{MIN_BTTS_PROB}%)")
+    eur_btts = df_btts[df_btts["region"] == "Europe"].sort_values(["prob"], ascending=False)
+    add_list_or_none(eur_btts, fmt_btts_line, 10)
 
-    def fmt_value_line(r):
-        return f"{r['kickoff']} {r['fixture']} - {r['market']} - {fmt_pct(r['prob'])} - +{fmt_pct(r['value_edge'])} - {r['league']}"
+    # --- WIN PICKS ---
+    print_section_header(f"Win Picks - England (≥{MIN_WIN_PROB}%)")
+    eng_win = df_win[df_win["region"] == "England"].sort_values(["prob"], ascending=False)
+    add_list_or_none(eng_win, fmt_win_line, 15)
 
-    # ---- BTTS regionals ----
-    eng_btts = df_btts[(df_btts["region"] == "England") & (df_btts["confidence"].isin(["High", "Medium"]))] \
-                .sort_values(["kickoff", "btts_prob"], ascending=[True, False])
-    sco_btts = df_btts[(df_btts["region"] == "Scotland") & (df_btts["confidence"].isin(["High", "Medium"]))] \
-                .sort_values(["kickoff", "btts_prob"], ascending=[True, False])
-    ger_btts = df_btts[(df_btts["region"] == "Germany") & (df_btts["confidence"].isin(["High", "Medium"]))] \
-                .sort_values(["kickoff", "btts_prob"], ascending=[True, False])
+    print_section_header(f"Top Combined Win Picks (≥{MIN_WIN_PROB}%)")
+    all_win = df_win.sort_values(["prob"], ascending=False)
+    add_list_or_none(all_win, fmt_win_line, 20)
 
-    print_section_header("BTTS - England (Top 10, Medium+)")
-    add_list_or_none(eng_btts, fmt_btts_line, 10)
+    # --- OVER 2.5 ---
+    print_section_header(f"Top Combined Over 2.5 Picks (≥{MIN_OVER_PROB}%)")
+    all_over = df_over.sort_values(["prob"], ascending=False)
+    add_list_or_none(all_over, fmt_over_line, 20)
 
-    print_section_header("BTTS - Scotland (Top 5, Medium+)")
-    add_list_or_none(sco_btts, fmt_btts_line, 5)
-
-    print_section_header("BTTS - Germany (Top 5, Medium+)")
-    add_list_or_none(ger_btts, fmt_btts_line, 5)
-
-    # ---- WIN: England top 10 and Combined top 10 ----
-    win_eng = df_match[(df_match["region"] == "England") & (df_match["confidence"].isin(["High", "Medium"]))] \
-                .sort_values(["kickoff", "win_prob"], ascending=[True, False])
-    print_section_header("Top 10 Win Picks - England (Medium+)")
-    add_list_or_none(win_eng, fmt_win_line, 10)
-
-    win_comb = df_match[df_match["confidence"].isin(["High", "Medium"])] \
-                .sort_values(["kickoff", "win_prob"], ascending=[True, False])
-    print_section_header("Top 10 Combined Win Picks (Medium+)")
-    add_list_or_none(win_comb, fmt_win_line, 10)
-
-    # ---- OVER 2.5: Combined top 10 ----
-    over_comb = df_over[df_over["confidence"].isin(["High", "Medium"])] \
-                .sort_values(["kickoff", "over25_prob"], ascending=[True, False])
-    print_section_header("Top 10 Combined Over 2.5 Picks (Medium+)")
-    add_list_or_none(over_comb, fmt_over_line, 10)
-
-    # ---- VALUE PICKS last ----
-    print_section_header("Value Picks (10+% edge)")
-    if df_value.empty:
-        lines.append("No value picks today")
-        lines.append("")
-    else:
-        val_sorted = df_value.sort_values(["kickoff", "value_edge"], ascending=[True, False]).head(20)
-        for _, r in val_sorted.iterrows():
-            lines.append(fmt_value_line(r))
-        lines.append("")
-
-    lines.append("Model run complete")
+    # Footer
+    lines.append("=======================================")
+    lines.append("Model run complete ✅")
+    lines.append(f"Generated: {dt.now(UTC).strftime('%a %d %b %Y %H:%M UTC')}")
+    lines.append("=======================================")
+    
+    with open("output_debug.txt", "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
 
     print("\n".join(lines))
-    return df_btts, df_match, df_over, df_value
-
+    return df_btts, df_win, df_over
 
 if __name__ == "__main__":
     main()
