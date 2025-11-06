@@ -53,13 +53,10 @@ def send_telegram(raw_text):
         return
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    # Wrap message in Markdown code block to preserve formatting
-    wrapped = f"```\n{raw_text.strip()}\n```"
-
+    # Just send plain text, no Markdown parsing
     payload = {
         "chat_id": CHAT_ID,
-        "text": wrapped[:3900],  # stay under Telegram limit
-        "parse_mode": "MarkdownV2",
+        "text": raw_text[:3900],
     }
 
     r = requests.post(url, json=payload)
@@ -74,12 +71,9 @@ def send_telegram_friend(raw_text):
         return
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    wrapped = f"```\n{raw_text.strip()}\n```"
-
     payload = {
         "chat_id": FRIEND_CHAT_ID,
-        "text": wrapped[:3900],
-        "parse_mode": "MarkdownV2",
+        "text": raw_text[:3900],
     }
 
     r = requests.post(url, json=payload)
@@ -87,7 +81,6 @@ def send_telegram_friend(raw_text):
         print("Telegram (friend) sent.")
     else:
         print(f"Telegram friend error {r.status_code}: {r.text}")
-
 
 # ==========================
 # RUN MODEL
