@@ -392,21 +392,19 @@ def confidence_label(pct: float) -> str:
 # =========================
 def main():
     lines = []
-    lines.append(f"Running xG-based Poisson model for fixtures on {TODAY}")
-    lines.append(f"(Professional-grade predictions using real expected goals data)")
+    lines.append(f"xG Poisson Model - {TODAY}")
     lines.append("")
-    lines.append(f"Fetching fixtures on {TODAY}...")
 
     df_fx = fetch_fixtures_for_today()
-    lines.append(f"Fixtures found: {len(df_fx)}")
-    lines.append("")
-
+    
     if df_fx.empty:
+        lines.append("No fixtures found")
         print("\n".join(lines))
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
     # Process each fixture
     btts_rows, over_rows, win_rows = [], [], []
+    predictions_for_tracking = {}  # For results tracker
     
     for idx, fx in df_fx.iterrows():
         hid, aid = int(fx["home_id"]), int(fx["away_id"])
@@ -423,6 +421,20 @@ def main():
         ko_str = fmt_time_eu(fx["kickoff"])
         
         data_quality = f"xG:{xg_data['home_xg']:.2f}-{xg_data['away_xg']:.2f} ({xg_data['home_games']}+{xg_data['away_games']})"
+        
+        # Save for results tracking
+        predictions_for_tracking[str(fx["fixture_id"])] = {
+            "home_team": unidecode(str(fx["home_team"])),
+            "away_team": unidecode(str(fx["away_team"])),
+            "league": league_str,
+            "home_win_prob": round(probs["home_win"], 2),
+            "away_win_prob": round(probs["away_win"], 2),
+            "draw_prob": round(probs["draw"], 2),
+            "btts_prob": round(probs["btts"], 2),
+            "over25_prob": round(probs["over25"], 2),
+            "home_xg": xg_data["home_xg"],
+            "away_xg": xg_data["away_xg"],
+        }
         
         # BTTS picks
         if probs["btts"] >= MIN_BTTS_PROB:
@@ -470,8 +482,8 @@ def main():
             })
         
         # Progress indicator
-        if (idx + 1) % 5 == 0:
-            print(f"Processed {idx + 1}/{len(df_fx)} fixtures...")
+        if (idx + 1) % 10 == 0:
+            print(f"Processing... {idx + 1}/{len(df_fx)}")
 
     df_btts = pd.DataFrame(btts_rows) if btts_rows else pd.DataFrame()
     df_over = pd.DataFrame(over_rows) if over_rows else pd.DataFrame()
@@ -484,18 +496,59 @@ def main():
         if not df.empty and "league" in df.columns:
             df.drop(df[df["league"].str.contains("EFL Trophy", case=False, na=False)].index, inplace=True)
 
-    # ===== OUTPUT =====
-    total_fixtures = len(df_fx)
-    total_btts = len(df_btts)
-    total_win = len(df_win)
-    total_over = len(df_over)
+    # ===== CREATE TOP PICKS =====
+    # Combine all markets and rank by probability * confidence
+    top_picks = []
+    
+    # Add win picks
+    for _, r in df_win.iterrows():
+        top_picks.append({
+            "kickoff": r["kickoff"],
+            "fixture": r["fixture"],
+            "league": r["league"],
+            "market": f"Win: {r['pick_team']}",
+            "prob": r["prob"],
+            "score": r["top_score"],
+            "xg": r["xg"],
+            "sort_score": r["prob"],  # Higher is better
+        })
+    
+    # Add BTTS picks (only high confidence)
+    for _, r in df_btts[df_btts["prob"] >= 60].iterrows():
+        top_picks.append({
+            "kickoff": r["kickoff"],
+            "fixture": r["fixture"],
+            "league": r["league"],
+            "market": "BTTS: Yes",
+            "prob": r["prob"],
+            "score": "N/A",
+            "xg": r["xg"],
+            "sort_score": r["prob"] * 0.95,  # Slightly lower weight than wins
+        })
+    
+    # Add Over 2.5 picks (only high confidence)
+    for _, r in df_over[df_over["prob"] >= 60].iterrows():
+        top_picks.append({
+            "kickoff": r["kickoff"],
+            "fixture": r["fixture"],
+            "league": r["league"],
+            "market": "Over 2.5",
+            "prob": r["prob"],
+            "score": "N/A",
+            "xg": r["xg"],
+            "sort_score": r["prob"] * 0.95,  # Slightly lower weight than wins
+        })
+    
+    # Sort by probability and take top 10
+    df_top = pd.DataFrame(top_picks).sort_values("sort_score", ascending=False).head(10) if top_picks else pd.DataFrame()
 
+    # ===== OUTPUT =====
     lines.append("=======================================")
-    lines.append(f"⚽ xG Poisson Model - {TODAY}")
-    lines.append(f"Fixtures: {total_fixtures} | BTTS: {total_btts} | Win: {total_win} | Over 2.5: {total_over}")
+    lines.append(f"⚽ PREDICTIONS - {TODAY}")
     lines.append("=======================================")
     lines.append("")
 
+    # Define helper functions first
     def conf_emoji(pct):
         if pct >= 80: return "🔥🔥"
         elif pct >= 70: return "🔥"
@@ -503,20 +556,20 @@ def main():
         else: return "❄️"
 
     def fmt_btts_line(r):
-        return f"• {r['kickoff']:<8} | {r['fixture']:<28} | {r['prob']:>5.1f}% {conf_emoji(r['prob'])} | {r['league']}"
+        return f"{r['kickoff']} | {r['fixture']:<28} | {r['prob']:>5.1f}% {conf_emoji(r['prob'])}"
 
     def fmt_over_line(r):
-        return f"• {r['kickoff']:<8} | {r['fixture']:<28} | {r['prob']:>5.1f}% {conf_emoji(r['prob'])} | {r['league']}"
+        return f"{r['kickoff']} | {r['fixture']:<28} | {r['prob']:>5.1f}% {conf_emoji(r['prob'])}"
 
     def fmt_win_line(r):
-        return f"• {r['kickoff']:<8} | {r['fixture']:<28} | {r['pick_team']:<16} | {r['prob']:>5.1f}% {conf_emoji(r['prob'])} [{r['top_score']}] | {r['league']}"
+        return f"{r['kickoff']} | {r['fixture']:<28} | {r['pick_team']:<16} {r['prob']:>5.1f}% {conf_emoji(r['prob'])} [{r['top_score']}]"
 
-    def print_section_header(title):
-        lines.append("=======================================")
+    def print_section_header_sub(title):
+        lines.append("")
         lines.append(title)
-        lines.append("=======================================")
+        lines.append("---------------------------------------")
 
-    def add_list_or_none(df, formatter, limit, none_msg="No qualifying picks"):
+    def add_list_or_none(df, formatter, limit, none_msg="None"):
         if df is None or df.empty:
             lines.append(none_msg)
             lines.append("")
@@ -525,74 +578,98 @@ def main():
             lines.append(formatter(r))
         lines.append("")
 
+    # ===== TOP PICKS SECTION (SHOW FIRST) =====
+    def print_section_header(title):
+        lines.append("=======================================")
+        lines.append(title)
+        lines.append("=======================================")
+
+    print_section_header("🔥 TOP 10 PICKS")
+    if not df_top.empty:
+        for idx, r in df_top.iterrows():
+            score_str = f" [{r['score']}]" if r['score'] != "N/A" else ""
+            lines.append(f"{idx+1}. {r['kickoff']} | {r['fixture']}")
+            lines.append(f"   {r['market']} - {r['prob']:.1f}% {conf_emoji(r['prob'])}{score_str}")
+            lines.append("")
+    else:
+        lines.append("No picks")
+        lines.append("")
+
     # BTTS
-    print_section_header(f"BTTS - England (≥{MIN_BTTS_PROB}%)")
+    print_section_header_sub(f"BTTS - England")
     if not df_btts.empty and "region" in df_btts.columns:
         eng_btts = df_btts[df_btts["region"] == "England"].sort_values(["prob"], ascending=False)
         add_list_or_none(eng_btts, fmt_btts_line, 15)
     else:
-        lines.append("No qualifying picks")
+        lines.append("None")
         lines.append("")
 
-    print_section_header(f"BTTS - Scotland (≥{MIN_BTTS_PROB}%)")
+    print_section_header_sub(f"BTTS - Scotland")
     if not df_btts.empty and "region" in df_btts.columns:
         sco_btts = df_btts[df_btts["region"] == "Scotland"].sort_values(["prob"], ascending=False)
         add_list_or_none(sco_btts, fmt_btts_line, 10)
     else:
-        lines.append("No qualifying picks")
+        lines.append("None")
         lines.append("")
 
-    print_section_header(f"BTTS - Germany (≥{MIN_BTTS_PROB}%)")
+    print_section_header_sub(f"BTTS - Germany")
     if not df_btts.empty and "region" in df_btts.columns:
         ger_btts = df_btts[df_btts["region"] == "Germany"].sort_values(["prob"], ascending=False)
         add_list_or_none(ger_btts, fmt_btts_line, 10)
     else:
-        lines.append("No qualifying picks")
+        lines.append("None")
         lines.append("")
 
-    print_section_header(f"BTTS - Europe (≥{MIN_BTTS_PROB}%)")
+    print_section_header_sub(f"BTTS - Europe")
     if not df_btts.empty and "region" in df_btts.columns:
         eur_btts = df_btts[df_btts["region"] == "Europe"].sort_values(["prob"], ascending=False)
         add_list_or_none(eur_btts, fmt_btts_line, 10)
     else:
-        lines.append("No qualifying picks")
+        lines.append("None")
         lines.append("")
 
     # WIN
-    print_section_header(f"Win Picks - England (≥{MIN_WIN_PROB}%)")
+    print_section_header_sub(f"Win - England")
     if not df_win.empty and "region" in df_win.columns:
         eng_win = df_win[df_win["region"] == "England"].sort_values(["prob"], ascending=False)
         add_list_or_none(eng_win, fmt_win_line, 15)
     else:
-        lines.append("No qualifying picks")
+        lines.append("None")
         lines.append("")
 
-    print_section_header(f"Top Combined Win Picks (≥{MIN_WIN_PROB}%)")
+    print_section_header_sub(f"Win - Combined")
     if not df_win.empty and "region" in df_win.columns:
         all_win = df_win.sort_values(["prob"], ascending=False)
         add_list_or_none(all_win, fmt_win_line, 20)
     else:
-        lines.append("No qualifying picks")
+        lines.append("None")
         lines.append("")
 
     # OVER 2.5
-    print_section_header(f"Top Combined Over 2.5 Picks (≥{MIN_OVER_PROB}%)")
+    print_section_header_sub(f"Over 2.5 - Combined")
     if not df_over.empty and "region" in df_over.columns:
         all_over = df_over.sort_values(["prob"], ascending=False)
         add_list_or_none(all_over, fmt_over_line, 20)
     else:
-        lines.append("No qualifying picks")
+        lines.append("None")
         lines.append("")
 
     lines.append("=======================================")
-    lines.append("Model run complete ✅")
-    lines.append(f"Generated: {dt.now(UTC).strftime('%a %d %b %Y %H:%M UTC')}")
+    lines.append("✅ Complete")
     lines.append("=======================================")
     
     with open("output_debug.txt", "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
 
     print("\n".join(lines))
+    
+    # Save predictions for tracking (optional - comment out if results_tracker.py not available)
+    # try:
+    #     from results_tracker import save_predictions
+    #     save_predictions(TODAY, predictions_for_tracking)
+    # except Exception as e:
+    #     print(f"Note: Could not save predictions for tracking: {e}")
+    
     return df_btts, df_win, df_over
 
 if __name__ == "__main__":
