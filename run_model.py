@@ -17,6 +17,25 @@ sys.stdout.reconfigure(encoding="utf-8", line_buffering=True)
 
 load_dotenv()
 
+def fetch_team_league(team_id: int, season: int):
+    """Fetch which league a team primarily plays in"""
+    # Try to find their league from fixtures this season
+    params = {"team": team_id, "season": season, "last": 5}
+    try:
+        r = requests.get(f"{BASE_URL}/fixtures", params=params, headers=HEADERS, timeout=12)
+        fixtures = r.json().get("response", [])
+        if fixtures:
+            # Return the most common league they play in
+            leagues = [f["league"]["id"] for f in fixtures]
+            return max(set(leagues), key=leagues.count)
+    except Exception:
+        pass
+    return None
+
+def get_division_strength(league_id: int) -> float:
+    """Get relative strength of a division"""
+    return DIVISION_STRENGTH.get(league_id, 0.70)  # Default to Championship level
+
 # =========================
 # CONFIG
 # =========================
@@ -57,6 +76,23 @@ OPPONENT_WEIGHTS = {
     "lower": 0.92,
     "bottom": 0.75,
 }
+
+# Divisional strength adjustments for cup games
+DIVISION_STRENGTH = {
+    39: 1.00,   # Premier League (baseline)
+    40: 0.70,   # Championship
+    41: 0.45,   # League One
+    42: 0.30,   # League Two
+    179: 0.80,  # Scottish Premiership
+    180: 0.55,  # Scottish Championship
+    78: 0.95,   # Bundesliga
+    2: 1.05,    # Champions League (top teams)
+    3: 1.00,    # Europa League
+    848: 0.95,  # Europa Conference League
+}
+
+# Cup competitions where divisional adjustments apply
+CUP_COMPETITIONS = [45, 48]  # FA Cup, EFL Cup
 
 # Cache
 STANDINGS_CACHE = {}
@@ -339,8 +375,25 @@ def calculate_match_xg(home_id: int, away_id: int, league_id: int):
     """
     Calculate expected goals for both teams in upcoming match.
     Uses opponent-weighted, recency-weighted xG from recent matches.
+    Applies divisional adjustments for cup games.
     """
     standings = fetch_league_standings(league_id)
+    
+    # Check if this is a cup game
+    is_cup = league_id in CUP_COMPETITIONS
+    
+    # If cup game, get each team's actual division
+    home_division_strength = 1.0
+    away_division_strength = 1.0
+    
+    if is_cup:
+        home_league = fetch_team_league(home_id, SEASON)
+        away_league = fetch_team_league(away_id, SEASON)
+        
+        if home_league:
+            home_division_strength = get_division_strength(home_league)
+        if away_league:
+            away_division_strength = get_division_strength(away_league)
     
     # Fetch xG data for home team at home
     home_data = fetch_xg_data_for_team(home_id, league_id, standings, venue="home")
@@ -355,11 +408,14 @@ def calculate_match_xg(home_id: int, away_id: int, league_id: int):
         away_data = fetch_xg_data_for_team(away_id, league_id, standings)
     
     # Calculate expected goals for this match
-    # Home xG = (Home attack strength) * (Away defense weakness)
-    # Away xG = (Away attack strength) * (Home defense weakness)
-    
-    home_xg = home_data["xg_for"] * (away_data["xg_against"] / 1.2)  # Normalize around league average
+    home_xg = home_data["xg_for"] * (away_data["xg_against"] / 1.2)
     away_xg = away_data["xg_for"] * (home_data["xg_against"] / 1.2)
+    
+    # Apply divisional adjustments for cup games
+    if is_cup:
+        # Adjust xG based on division strength
+        home_xg = home_xg * home_division_strength
+        away_xg = away_xg * away_division_strength
     
     # Apply home advantage
     home_xg = home_xg * (1 + HOME_ADVANTAGE)
