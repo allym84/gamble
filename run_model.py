@@ -557,43 +557,46 @@ def main():
     top_picks = []
     
     # Add win picks
-    for _, r in df_win.iterrows():
-        top_picks.append({
-            "kickoff": r["kickoff"],
-            "fixture": r["fixture"],
-            "league": r["league"],
-            "market": f"Win: {r['pick_team']}",
-            "prob": r["prob"],
-            "score": r["top_score"],
-            "xg": r["xg"],
-            "sort_score": r["prob"],  # Higher is better
-        })
+    if not df_win.empty:
+        for _, r in df_win.iterrows():
+            top_picks.append({
+                "kickoff": r["kickoff"],
+                "fixture": r["fixture"],
+                "league": r["league"],
+                "market": f"Win: {r['pick_team']}",
+                "prob": r["prob"],
+                "score": r["top_score"],
+                "xg": r["xg"],
+                "sort_score": r["prob"],  # Higher is better
+            })
     
     # Add BTTS picks (only high confidence)
-    for _, r in df_btts[df_btts["prob"] >= 60].iterrows():
-        top_picks.append({
-            "kickoff": r["kickoff"],
-            "fixture": r["fixture"],
-            "league": r["league"],
-            "market": "BTTS: Yes",
-            "prob": r["prob"],
-            "score": "N/A",
-            "xg": r["xg"],
-            "sort_score": r["prob"] * 0.95,  # Slightly lower weight than wins
-        })
+    if not df_btts.empty and "prob" in df_btts.columns:
+        for _, r in df_btts[df_btts["prob"] >= 60].iterrows():
+            top_picks.append({
+                "kickoff": r["kickoff"],
+                "fixture": r["fixture"],
+                "league": r["league"],
+                "market": "BTTS: Yes",
+                "prob": r["prob"],
+                "score": "N/A",
+                "xg": r["xg"],
+                "sort_score": r["prob"] * 0.95,  # Slightly lower weight than wins
+            })
     
     # Add Over 2.5 picks (only high confidence)
-    for _, r in df_over[df_over["prob"] >= 60].iterrows():
-        top_picks.append({
-            "kickoff": r["kickoff"],
-            "fixture": r["fixture"],
-            "league": r["league"],
-            "market": "Over 2.5",
-            "prob": r["prob"],
-            "score": "N/A",
-            "xg": r["xg"],
-            "sort_score": r["prob"] * 0.95,  # Slightly lower weight than wins
-        })
+    if not df_over.empty and "prob" in df_over.columns:
+        for _, r in df_over[df_over["prob"] >= 60].iterrows():
+            top_picks.append({
+                "kickoff": r["kickoff"],
+                "fixture": r["fixture"],
+                "league": r["league"],
+                "market": "Over 2.5",
+                "prob": r["prob"],
+                "score": "N/A",
+                "xg": r["xg"],
+                "sort_score": r["prob"] * 0.95,  # Slightly lower weight than wins
+            })
     
     # Sort by probability and take top 10
     df_top = pd.DataFrame(top_picks).sort_values("sort_score", ascending=False).head(10) if top_picks else pd.DataFrame()
