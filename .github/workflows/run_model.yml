@@ -4,7 +4,7 @@ name: Daily Auto Model
 
 on:
   schedule:
-    - cron: "0 10 * * *" # Run every day at 10:00 UTC
+    - cron: "0 9 * * *" # Run every day at 09:00 UTC
   workflow_dispatch: # Manual run button
 
 jobs:
