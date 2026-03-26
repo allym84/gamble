@@ -1,36 +1,46 @@
 # Enable schedule trigger
 # adding this so I can push changes and test the workflow manually 
-name: Daily Auto Model
+name: Run Betting Model
 
 on:
   schedule:
-    - cron: "0 10 * * *" # Run every day at 10:00 UTC
-  workflow_dispatch: # Manual run button
+    - cron: '0 8 * * *'  # Adjust to your schedule
+  workflow_dispatch:  # Allows manual runs
 
 jobs:
-  run:
+  run-model:
     runs-on: ubuntu-latest
-
+    
     steps:
-      - uses: actions/checkout@v3
-
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Cache model data
+        uses: actions/cache@v3
+        with:
+          path: cache/
+          key: model-cache-${{ github.run_date }}
+          restore-keys: |
+            model-cache-
+      
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: "3.11"
-
+          python-version: '3.11'
+          cache: 'pip'
+      
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
           pip install -r requirements.txt
-
-      - name: Run auto_model.py
+      
+      - name: Run model
         env:
           APIFOOTBALL_API_KEY: ${{ secrets.APIFOOTBALL_API_KEY }}
-          EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
-          EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
-          EMAIL_RECIPIENT: ${{ secrets.EMAIL_RECIPIENT }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TELEGRAM_CHAT_ID_FRIEND: ${{ secrets.TELEGRAM_CHAT_ID_FRIEND }}
-        run: python auto_model.py
+          EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
+          EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
+          EMAIL_RECIPIENT: ${{ secrets.EMAIL_RECIPIENT }}
+        run: |
+          python auto_model.py 
